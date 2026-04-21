@@ -96,16 +96,18 @@ jobs:
       - name: Build CLI (musl via docker)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+          docker run --rm -v "$PWD":/src -w /src \
             messense/rust-musl-cross:x86_64-musl \
             cargo build --release --target x86_64-unknown-linux-musl --bin mhrv-rs
+          sudo chown -R "$(id -u):$(id -g)" target
 
       - name: Build CLI (musl via docker, arm64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
-          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD":/src -w /src \
+          docker run --rm -v "$PWD":/src -w /src \
             messense/rust-musl-cross:aarch64-musl \
             cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
+          sudo chown -R "$(id -u):$(id -g)" target
 
       # UI build: we try to build the UI binary on every platform. If it fails
       # on cross-compile for linux-arm64 (missing arm64 system libs cross),
