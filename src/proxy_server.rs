@@ -308,17 +308,7 @@ async fn dispatch_tunnel(
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
     }
 
-    // 2. IP-literal destinations are almost always app-level custom protocols
-    //    (xray/VLESS, torrent, SSH, VPN, raw TCP). Browsers never use raw IPs
-    //    in CONNECT. MITMing these would break the app's own TLS/auth, and
-    //    trying to relay opaque bytes through Apps Script always fails.
-    //    Always plain TCP passthrough for IP literals.
-    if is_ip_literal(&host) {
-        plain_tcp_passthrough(sock, &host, port).await;
-        return Ok(());
-    }
-
-    // 3. Peek at the first byte to detect TLS vs plain. Time-bounded — if the
+    // 2. Peek at the first byte to detect TLS vs plain. Time-bounded — if the
     //    client doesn't send anything within 300ms, assume server-first
     //    protocol (SMTP, POP3, FTP banner) and jump straight to plain TCP.
     let mut peek_buf = [0u8; 8];
@@ -353,13 +343,6 @@ async fn dispatch_tunnel(
 
     plain_tcp_passthrough(sock, &host, port).await;
     Ok(())
-}
-
-// ---------- IP literal detection ----------
-
-fn is_ip_literal(host: &str) -> bool {
-    let h = host.trim_start_matches('[').trim_end_matches(']');
-    h.parse::<std::net::IpAddr>().is_ok()
 }
 
 // ---------- Plain TCP passthrough ----------
