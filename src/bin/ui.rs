@@ -85,15 +85,19 @@ struct UiState {
     last_stats: Option<mhrv_rs::domain_fronter::StatsSnapshot>,
     last_per_site: Vec<(String, mhrv_rs::domain_fronter::HostStat)>,
     log: VecDeque<String>,
+    /// Result + timestamp for transient status banners (auto-hide after 10s).
     ca_trusted: Option<bool>,
+    ca_trusted_at: Option<Instant>,
     last_test_ok: Option<bool>,
     last_test_msg: String,
+    last_test_msg_at: Option<Instant>,
     /// Per-SNI probe results, populated by Cmd::TestSni / TestAllSni.
     sni_probe: HashMap<String, SniProbeState>,
     /// Most recent result of the Check-for-updates button (issue #15).
     /// `None` = never checked this session. `Some(InFlight)` during the
     /// probe, then the resolved outcome.
     last_update_check: Option<UpdateProbeState>,
+    last_update_check_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -163,6 +167,8 @@ struct FormState {
     sni_custom_input: String,
     /// Whether the floating SNI editor window is open.
     sni_editor_open: bool,
+    /// Whether the Recent log panel is shown. User toggles with a checkbox.
+    show_log: bool,
     fetch_ips_from_api: bool,
     max_ips_to_scan: usize,
     scan_batch_size:usize,
@@ -237,6 +243,7 @@ fn load_form() -> (FormState, Option<String>) {
             sni_pool,
             sni_custom_input: String::new(),
             sni_editor_open: false,
+            show_log: true,
             fetch_ips_from_api:c.fetch_ips_from_api,
             max_ips_to_scan:c.max_ips_to_scan,
             google_ip_validation: c.google_ip_validation,
@@ -259,6 +266,7 @@ fn load_form() -> (FormState, Option<String>) {
             sni_pool: sni_pool_for_form(None, "www.google.com"),
             sni_custom_input: String::new(),
             sni_editor_open: false,
+            show_log: true,
             fetch_ips_from_api:false,
             max_ips_to_scan:100,
             google_ip_validation:true,
@@ -466,6 +474,63 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
     }
 }
 
+/// Accent color — same blue used throughout the UI for primary actions.
+const ACCENT: egui::Color32 = egui::Color32::from_rgb(70, 120, 180);
+const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(90, 145, 205);
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 180, 100);
+const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 110, 110);
+
+/// Draw a "section card" — a rounded frame with a faint fill and a small
+/// heading above it. Used to visually group related form rows.
+fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new(title)
+            .size(12.0)
+            .color(egui::Color32::from_gray(180))
+            .strong(),
+    );
+    ui.add_space(2.0);
+    let frame = egui::Frame::none()
+        .fill(egui::Color32::from_rgb(28, 30, 34))
+        .stroke(egui::Stroke::new(
+            1.0,
+            egui::Color32::from_rgb(50, 54, 60),
+        ))
+        .rounding(6.0)
+        .inner_margin(egui::Margin::same(10.0));
+    frame.show(ui, body);
+}
+
+/// A primary accent-filled button. Used for the headline action in a row
+/// (Start / Stop / SNI pool).
+fn primary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE).strong())
+        .fill(ACCENT)
+        .min_size(egui::vec2(120.0, 28.0))
+        .rounding(4.0)
+}
+
+/// A compact form row: label on the left (fixed width for vertical alignment),
+/// widget on the right filling the remaining space.
+fn form_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    hover: Option<&str>,
+    widget: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        let resp = ui.add_sized(
+            [120.0, 20.0],
+            egui::Label::new(egui::RichText::new(label).color(egui::Color32::from_gray(200))),
+        );
+        if let Some(h) = hover {
+            resp.on_hover_text(h);
+        }
+        widget(ui);
+    });
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         if self.last_poll.elapsed() > Duration::from_millis(700) {
@@ -484,174 +549,243 @@ impl eframe::App for App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
+
+            // ── Header row: project name, version (→ github), status pill ─
+            let running = self.shared.state.lock().unwrap().running;
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("mhrv-rs  {}", VERSION))
-                    .size(16.0));
-                ui.add_space(8.0);
-                let running = self.shared.state.lock().unwrap().running;
-                let dot = if running { "running" } else { "stopped" };
-                let color = if running { egui::Color32::from_rgb(70, 170, 100) } else { egui::Color32::from_rgb(170, 90, 90) };
-                ui.label(egui::RichText::new(dot).color(color).monospace());
+                ui.hyperlink_to(
+                    egui::RichText::new("mhrv-rs").size(20.0).strong(),
+                    "https://github.com/therealaleph/MasterHttpRelayVPN-RUST",
+                );
+                ui.hyperlink_to(
+                    egui::RichText::new(format!("v{}", VERSION))
+                        .color(egui::Color32::from_gray(140))
+                        .monospace(),
+                    format!(
+                        "https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/tag/v{}",
+                        VERSION
+                    ),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let (fill, dot, label) = if running {
+                        (
+                            egui::Color32::from_rgb(30, 60, 40),
+                            OK_GREEN,
+                            "running",
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(60, 35, 35),
+                            ERR_RED,
+                            "stopped",
+                        )
+                    };
+                    egui::Frame::none()
+                        .fill(fill)
+                        .rounding(12.0)
+                        .inner_margin(egui::Margin::symmetric(10.0, 3.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(rect.center(), 4.0, dot);
+                                ui.label(
+                                    egui::RichText::new(label)
+                                        .color(dot)
+                                        .monospace()
+                                        .strong(),
+                                );
+                            });
+                        });
+                });
             });
 
-            ui.separator();
+            ui.add_space(2.0);
 
-            // Config form.
-            egui::Grid::new("cfg")
-                .num_columns(2)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Apps Script ID(s)")
-                        .on_hover_text(
-                            "One deployment ID per line.\n\
-                             With multiple IDs the proxy round-robins between them and\n\
-                             automatically sidelines any ID that hits its daily quota (429)\n\
-                             or other rate limits for 10 minutes before retrying it."
-                        );
+            // ── Section: Apps Script relay ────────────────────────────────
+            section(ui, "Apps Script relay", |ui| {
+                form_row(ui, "Deployment IDs", Some(
+                    "One deployment ID per line. Proxy round-robins between them and sidelines \
+                     any ID that hits its daily quota for 10 minutes before retrying."
+                ), |ui| {
                     ui.add(egui::TextEdit::multiline(&mut self.form.script_id)
                         .hint_text("one deployment ID per line")
                         .desired_width(f32::INFINITY)
                         .desired_rows(3));
-                    ui.end_row();
-
-                    let id_count = self.form.script_id
-                        .split(|c: char| c == '\n' || c == ',')
-                        .map(|s| s.trim())
-                        .filter(|s| !s.is_empty())
-                        .count();
-                    ui.label("");
-                    if id_count <= 1 {
-                        ui.small("Tip: add more IDs (one per line) for round-robin rotation with auto-failover on quota.");
-                    } else {
-                        ui.small(format!("{} IDs — round-robin with auto-failover on quota.", id_count));
-                    }
-                    ui.end_row();
-
-                    ui.label("Auth key");
-                    ui.horizontal(|ui| {
-                        let te = egui::TextEdit::singleline(&mut self.form.auth_key)
-                            .password(!self.form.show_auth_key)
-                            .desired_width(f32::INFINITY);
-                        ui.add(te);
-                    });
-                    ui.end_row();
-
-                    ui.label("Google IP");
-                    ui.horizontal(|ui| {
-                        ui.text_edit_singleline(&mut self.form.google_ip);
-                        if ui.button("scan").on_hover_text(
-                            "Try several known Google frontend IPs and report which are reachable (results printed to stdout/terminal)"
-                        ).clicked() {
-                            if let Ok(cfg) = self.form.to_config() {
-                                let _ = self.cmd_tx.send(Cmd::Test(cfg.clone()));
-                                self.toast = Some(("Scan started — check terminal for full results".into(), Instant::now()));
-                            }
-                        }
-                    });
-                    ui.end_row();
-
-                    ui.label("Front domain");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.front_domain)
-                        .desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("Listen host");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_host)
-                        .desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("HTTP port");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_port).desired_width(80.0));
-                    ui.end_row();
-
-                    ui.label("SOCKS5 port");
-                    ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port).desired_width(80.0));
-                    ui.end_row();
-
-                    ui.label("Upstream SOCKS5")
-                        .on_hover_text(
-                            "Optional. host:port of an upstream SOCKS5 proxy (e.g. xray / v2ray / sing-box).\n\
-                             When set, non-HTTP / raw-TCP traffic arriving on the SOCKS5 listener is\n\
-                             chained through this proxy instead of connecting directly — this is what\n\
-                             makes Telegram MTProto, IMAP, SSH etc. actually tunnel.\n\
-                             HTTP/HTTPS traffic still routes through the Apps Script relay and the\n\
-                             SNI-rewrite tunnel as before."
-                        );
-                    ui.add(egui::TextEdit::singleline(&mut self.form.upstream_socks5)
-                        .hint_text("empty = direct; 127.0.0.1:50529 for a local xray")
-                        .desired_width(f32::INFINITY));
-                    ui.end_row();
-
-                    ui.label("Parallel dispatch")
-                        .on_hover_text(
-                            "Fire this many Apps Script IDs in parallel per relay request and\n\
-                             return the first successful response. 0/1 = off (round-robin).\n\
-                             Higher values eliminate long-tail latency (slow script instance\n\
-                             doesn't hold up the fast one) but spend that many times more\n\
-                             daily quota. Only effective with multiple IDs configured.\n\
-                             Recommend 2-3 if you have plenty of quota headroom."
-                        );
-                    ui.add(egui::DragValue::new(&mut self.form.parallel_relay)
-                        .speed(1)
-                        .range(0..=8));
-                    ui.end_row();
-
-                    ui.label("Log level");
-                    egui::ComboBox::from_id_source("loglevel")
-                        .selected_text(&self.form.log_level)
-                        .show_ui(ui, |ui| {
-                            for lvl in ["warn", "info", "debug", "trace"] {
-                                ui.selectable_value(&mut self.form.log_level, lvl.into(), lvl);
-                            }
-                        });
-                    ui.end_row();
-
-                    ui.label("");
-                    ui.checkbox(&mut self.form.verify_ssl, "Verify TLS server certificate (recommended)");
-                    ui.end_row();
-
-                    ui.label("");
-                    ui.checkbox(&mut self.form.show_auth_key, "Show auth key");
-                    ui.end_row();
                 });
 
-            ui.add_space(4.0);
+                let id_count = self.form.script_id
+                    .split(|c: char| c == '\n' || c == ',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .count();
+                ui.horizontal(|ui| {
+                    ui.add_space(120.0 + 8.0);
+                    if id_count <= 1 {
+                        ui.small(egui::RichText::new("Tip: add more IDs for round-robin with auto-failover.")
+                            .color(egui::Color32::from_gray(140)));
+                    } else {
+                        ui.small(egui::RichText::new(format!(
+                            "{} IDs — round-robin with auto-failover on quota.", id_count
+                        )).color(OK_GREEN));
+                    }
+                });
+
+                form_row(ui, "Auth key", Some(
+                    "Same value as AUTH_KEY inside your Code.gs."
+                ), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.form.auth_key)
+                        .password(!self.form.show_auth_key)
+                        .desired_width(f32::INFINITY));
+                });
+            });
+
+            // ── Section: Network ──────────────────────────────────────────
+            section(ui, "Network", |ui| {
+                form_row(ui, "Google IP", None, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.form.google_ip)
+                        .desired_width(f32::INFINITY));
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(120.0 + 8.0);
+                    if ui.small_button("scan IPs")
+                        .on_hover_text(
+                            "Probe known Google frontend IPs; report which are reachable \
+                             (results go to the log panel)."
+                        )
+                        .clicked()
+                    {
+                        if let Ok(cfg) = self.form.to_config() {
+                            let _ = self.cmd_tx.send(Cmd::Test(cfg.clone()));
+                            self.toast = Some((
+                                "Scan started — check the Recent log below.".into(),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                    let active_sni = self.form.sni_pool.iter().filter(|r| r.enabled).count();
+                    let total_sni = self.form.sni_pool.len();
+                    let sni_btn = egui::Button::new(
+                        egui::RichText::new(format!("SNI pool… ({}/{})", active_sni, total_sni))
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(ACCENT)
+                    .rounding(4.0);
+                    if ui.add(sni_btn)
+                        .on_hover_text(
+                            "Open the SNI rotation pool editor. Test which front-domain \
+                             names get through your network's DPI."
+                        )
+                        .clicked()
+                    {
+                        self.form.sni_editor_open = true;
+                    }
+                });
+
+                form_row(ui, "Front domain", None, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.form.front_domain)
+                        .desired_width(f32::INFINITY));
+                });
+
+                form_row(ui, "Listen host", None, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_host)
+                        .desired_width(f32::INFINITY));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [120.0, 20.0],
+                        egui::Label::new(egui::RichText::new("Ports")
+                            .color(egui::Color32::from_gray(200))),
+                    );
+                    ui.label(egui::RichText::new("HTTP").small());
+                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_port).desired_width(70.0));
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new("SOCKS5").small());
+                    ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port).desired_width(70.0));
+                });
+            });
+
+            // ── Section: Advanced (collapsed by default) ──────────────────
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(
+                egui::RichText::new("Advanced")
+                    .size(12.0)
+                    .color(egui::Color32::from_gray(180))
+                    .strong(),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                let frame = egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(28, 30, 34))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 54, 60)))
+                    .rounding(6.0)
+                    .inner_margin(egui::Margin::same(10.0));
+                frame.show(ui, |ui| {
+                    form_row(ui, "Upstream SOCKS5", Some(
+                        "Optional. host:port of a local xray / v2ray / sing-box SOCKS5 inbound. \
+                         When set, non-HTTP / raw-TCP traffic (Telegram MTProto, IMAP, SSH, …) \
+                         is chained through it instead of direct. HTTP/HTTPS still go through \
+                         the Apps Script relay."
+                    ), |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.form.upstream_socks5)
+                            .hint_text("empty = direct; 127.0.0.1:50529 for local xray")
+                            .desired_width(f32::INFINITY));
+                    });
+
+                    form_row(ui, "Parallel dispatch", Some(
+                        "Fire N Apps Script IDs in parallel per request and take the first \
+                         response. 0/1 = off. 2-3 kills long-tail latency at N× quota cost. \
+                         Only effective with multiple IDs configured."
+                    ), |ui| {
+                        ui.add(egui::DragValue::new(&mut self.form.parallel_relay)
+                            .speed(1)
+                            .range(0..=8));
+                    });
+
+                    form_row(ui, "Log level", None, |ui| {
+                        egui::ComboBox::from_id_source("loglevel")
+                            .selected_text(&self.form.log_level)
+                            .show_ui(ui, |ui| {
+                                for lvl in ["warn", "info", "debug", "trace"] {
+                                    ui.selectable_value(&mut self.form.log_level, lvl.into(), lvl);
+                                }
+                            });
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.verify_ssl, "Verify TLS server certificate (recommended)");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.show_auth_key, "Show auth key");
+                    });
+                });
+            });
+
+            // ── Bottom of form: Save + config-path hint ───────────────────
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                if ui.button("Save config").clicked() {
+                if ui.add(primary_button("Save config")).clicked() {
                     match self.form.to_config().and_then(|c| save_config(&c)) {
                         Ok(p) => self.toast = Some((format!("Saved to {}", p.display()), Instant::now())),
                         Err(e) => self.toast = Some((format!("Save failed: {}", e), Instant::now())),
                     }
                 }
-                let active_sni = self.form.sni_pool.iter().filter(|r| r.enabled).count();
-                let total_sni = self.form.sni_pool.len();
-                let sni_btn = egui::Button::new(
-                    egui::RichText::new(format!("SNI pool… ({}/{})", active_sni, total_sni))
-                        .color(egui::Color32::WHITE),
-                )
-                .fill(egui::Color32::from_rgb(70, 120, 180))
-                .min_size(egui::vec2(160.0, 0.0));
-                if ui.add(sni_btn)
-                    .on_hover_text(
-                        "Open the SNI rotation pool editor.\n\n\
-                         Edit which SNI names get rotated through for outbound TLS to the\n\
-                         Google edge. Some default names may be locally blocked — use the\n\
-                         Test buttons inside to find out which ones work on your network."
-                    )
-                    .clicked()
-                {
-                    self.form.sni_editor_open = true;
-                }
-                ui.small(format!("location: {}", data_dir::config_path().display()));
+                ui.small(egui::RichText::new(format!("→ {}", data_dir::config_path().display()))
+                    .color(egui::Color32::from_gray(130)));
             });
 
             // Floating SNI editor window. Rendered here so it's inside the
             // same egui context but visually pops out with its own title bar.
             self.show_sni_editor(ctx);
 
-            ui.separator();
+            ui.add_space(8.0);
 
-            // Status + stats
+            // ── Status + stats card ────────────────────────────────────────
             let (running, started_at, stats, ca_trusted, last_test_msg, per_site) = {
                 let s = self.shared.state.lock().unwrap();
                 (
@@ -664,49 +798,76 @@ impl eframe::App for App {
                 )
             };
 
-            ui.horizontal(|ui| {
-                if running {
-                    let up = started_at.map(|t| t.elapsed()).unwrap_or_default();
-                    ui.label(egui::RichText::new(format!(
-                        "Status: running  (uptime {})", fmt_duration(up)
-                    )).strong());
+            let status_title = if running {
+                let up = started_at.map(|t| t.elapsed()).unwrap_or_default();
+                format!("Traffic  ·  uptime {}", fmt_duration(up))
+            } else {
+                "Traffic  ·  (not running)".to_string()
+            };
+            section(ui, &status_title, |ui| {
+                if let Some(s) = stats {
+                    // Compact two-column layout so 7 metrics fit in ~4 rows
+                    // instead of a tall vertical strip.
+                    let rows: Vec<(&str, String)> = vec![
+                        ("relay calls", s.relay_calls.to_string()),
+                        ("failures", s.relay_failures.to_string()),
+                        ("coalesced", s.coalesced.to_string()),
+                        (
+                            "cache hits",
+                            format!(
+                                "{} / {}  ({:.0}%)",
+                                s.cache_hits,
+                                s.cache_hits + s.cache_misses,
+                                s.hit_rate()
+                            ),
+                        ),
+                        ("cache size", format!("{} KB", s.cache_bytes / 1024)),
+                        ("bytes relayed", fmt_bytes(s.bytes_relayed)),
+                        (
+                            "active scripts",
+                            format!(
+                                "{} / {}",
+                                s.total_scripts - s.blacklisted_scripts,
+                                s.total_scripts
+                            ),
+                        ),
+                    ];
+                    egui::Grid::new("stats")
+                        .num_columns(4)
+                        .spacing([16.0, 4.0])
+                        .show(ui, |ui| {
+                            for chunk in rows.chunks(2) {
+                                for (label, value) in chunk.iter() {
+                                    ui.add_sized(
+                                        [110.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(*label)
+                                                .color(egui::Color32::from_gray(150)),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        [140.0, 18.0],
+                                        egui::Label::new(
+                                            egui::RichText::new(value).monospace(),
+                                        ),
+                                    );
+                                }
+                                // Pad the final short row so grid columns stay aligned.
+                                if chunk.len() == 1 {
+                                    ui.label("");
+                                    ui.label("");
+                                }
+                                ui.end_row();
+                            }
+                        });
                 } else {
-                    ui.label(egui::RichText::new("Status: stopped").strong());
+                    ui.label(
+                        egui::RichText::new("No traffic yet — click Start and send a request.")
+                            .color(egui::Color32::from_gray(150))
+                            .italics(),
+                    );
                 }
             });
-
-            if let Some(s) = stats {
-                egui::Grid::new("stats").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
-                    ui.label("relay calls");
-                    ui.label(egui::RichText::new(s.relay_calls.to_string()).monospace());
-                    ui.end_row();
-                    ui.label("failures");
-                    ui.label(egui::RichText::new(s.relay_failures.to_string()).monospace());
-                    ui.end_row();
-                    ui.label("coalesced");
-                    ui.label(egui::RichText::new(s.coalesced.to_string()).monospace());
-                    ui.end_row();
-                    ui.label("cache hits / total");
-                    ui.label(egui::RichText::new(format!(
-                        "{} / {}  ({:.0}%)",
-                        s.cache_hits,
-                        s.cache_hits + s.cache_misses,
-                        s.hit_rate()
-                    )).monospace());
-                    ui.end_row();
-                    ui.label("cache size");
-                    ui.label(egui::RichText::new(format!("{} KB", s.cache_bytes / 1024)).monospace());
-                    ui.end_row();
-                    ui.label("bytes relayed");
-                    ui.label(egui::RichText::new(fmt_bytes(s.bytes_relayed)).monospace());
-                    ui.end_row();
-                    ui.label("active scripts");
-                    ui.label(egui::RichText::new(format!(
-                        "{} / {}", s.total_scripts - s.blacklisted_scripts, s.total_scripts
-                    )).monospace());
-                    ui.end_row();
-                });
-            }
 
             if !per_site.is_empty() {
                 ui.add_space(2.0);
@@ -743,11 +904,18 @@ impl eframe::App for App {
                     });
             }
 
-            ui.add_space(4.0);
+            ui.add_space(8.0);
 
+            // ── Primary action: Start / Stop is the headline; others smaller ──
             ui.horizontal(|ui| {
                 if !running {
-                    if ui.button("Start").clicked() {
+                    let btn = egui::Button::new(
+                        egui::RichText::new("▶  Start").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(OK_GREEN)
+                    .min_size(egui::vec2(120.0, 32.0))
+                    .rounding(4.0);
+                    if ui.add(btn).clicked() {
                         match self.form.to_config() {
                             Ok(cfg) => {
                                 let _ = self.cmd_tx.send(Cmd::Start(cfg));
@@ -757,11 +925,23 @@ impl eframe::App for App {
                             }
                         }
                     }
-                } else if ui.button("Stop").clicked() {
-                    let _ = self.cmd_tx.send(Cmd::Stop);
+                } else {
+                    let btn = egui::Button::new(
+                        egui::RichText::new("■  Stop").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(ERR_RED)
+                    .min_size(egui::vec2(120.0, 32.0))
+                    .rounding(4.0);
+                    if ui.add(btn).clicked() {
+                        let _ = self.cmd_tx.send(Cmd::Stop);
+                    }
                 }
 
-                if ui.button("Test").clicked() {
+                if ui.add(
+                    egui::Button::new("Test relay")
+                        .min_size(egui::vec2(0.0, 32.0))
+                        .rounding(4.0),
+                ).on_hover_text("Send one request through the Apps Script relay end-to-end and report the result.").clicked() {
                     match self.form.to_config() {
                         Ok(cfg) => {
                             let _ = self.cmd_tx.send(Cmd::Test(cfg));
@@ -771,16 +951,18 @@ impl eframe::App for App {
                         }
                     }
                 }
+            });
 
-                if ui.button("Install CA").clicked() {
+            // Secondary actions — smaller, grouped together on their own line.
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.small_button("Install CA").clicked() {
                     let _ = self.cmd_tx.send(Cmd::InstallCa);
                 }
-
-                if ui.button("Check CA").clicked() {
+                if ui.small_button("Check CA").clicked() {
                     let _ = self.cmd_tx.send(Cmd::CheckCaTrusted);
                 }
-
-                if ui.button("Check for updates")
+                if ui.small_button("Check for updates")
                     .on_hover_text(
                         "Ping github.com, then ask the Releases API for the latest tag and \
                          compare against this running version. No background polling — only \
@@ -790,79 +972,165 @@ impl eframe::App for App {
                 {
                     let _ = self.cmd_tx.send(Cmd::CheckUpdate);
                 }
+                let _ = ACCENT_HOVER; // silence unused const warning if it occurs
             });
 
-            if !last_test_msg.is_empty() {
-                ui.small(last_test_msg);
-            }
-            match ca_trusted {
-                Some(true) => {
-                    ui.small("CA appears trusted on this machine.");
-                }
-                Some(false) => {
-                    ui.small(
-                        "CA is NOT trusted in the system store. Click 'Install CA' \
-                         (may require admin). If you already installed it and this \
-                         still says NO, you may be on an older build — v0.8.5+ \
-                         checks the Windows store correctly.",
-                    );
-                }
-                None => {}
-            }
-            if ca_trusted.is_some() {
-                let ca_path = data_dir::data_dir().join("ca").join("ca.crt");
-                ui.small(format!(
-                    "For other devices (Android, other PCs) connecting through this proxy: \
-                     copy {} and install as a trusted root on that device. On Android 7+ \
-                     most apps ignore user-installed CAs — Firefox Android works; Chrome \
-                     and many others don't.",
-                    ca_path.display()
-                ));
-            }
+            // ── Transient status line ─────────────────────────────────────
+            // One compact line at most. Everything auto-hides after 10s so
+            // stale messages don't keep pushing the log panel off-screen.
+            // Priority: update-check in flight > fresh test msg > fresh CA
+            // result > update-check result. Old/expired entries are dropped.
+            const TRANSIENT_TTL: Duration = Duration::from_secs(10);
+            let (test_msg_fresh, ca_trusted_fresh, update_check_fresh) = {
+                let s = self.shared.state.lock().unwrap();
+                (
+                    s.last_test_msg_at
+                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                    s.ca_trusted_at
+                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                    s.last_update_check_at
+                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                )
+            };
 
-            // Update-check result (issue #15): only shown after the user
-            // clicks "Check for updates". No background polling.
-            if let Some(state) = &self.shared.state.lock().unwrap().last_update_check.clone() {
-                match state {
-                    UpdateProbeState::InFlight => {
-                        ui.small(egui::RichText::new("Checking for updates…")
-                            .color(egui::Color32::GRAY));
-                    }
-                    UpdateProbeState::Done(r) => {
-                        use mhrv_rs::update_check::UpdateCheck;
-                        let (txt, color) = match r {
-                            UpdateCheck::UpToDate { .. } => (
-                                r.summary(),
-                                egui::Color32::from_rgb(80, 180, 100),
-                            ),
-                            UpdateCheck::UpdateAvailable { .. } => (
-                                r.summary(),
-                                egui::Color32::from_rgb(220, 170, 80),
-                            ),
-                            UpdateCheck::Offline(_) | UpdateCheck::Error(_) => (
-                                r.summary(),
-                                egui::Color32::from_rgb(220, 110, 110),
-                            ),
-                        };
-                        ui.small(egui::RichText::new(txt).color(color));
-                        if let UpdateCheck::UpdateAvailable { release_url, .. } = r {
-                            ui.hyperlink_to("Open release page", release_url);
+            let mut shown_any = false;
+            let update_is_inflight = matches!(
+                self.shared.state.lock().unwrap().last_update_check,
+                Some(UpdateProbeState::InFlight)
+            );
+            if update_is_inflight {
+                ui.small(
+                    egui::RichText::new("Checking for updates…")
+                        .color(egui::Color32::GRAY),
+                );
+                shown_any = true;
+            } else if update_check_fresh {
+                if let Some(UpdateProbeState::Done(r)) =
+                    &self.shared.state.lock().unwrap().last_update_check.clone()
+                {
+                    use mhrv_rs::update_check::UpdateCheck;
+                    let color = match r {
+                        UpdateCheck::UpToDate { .. } => OK_GREEN,
+                        UpdateCheck::UpdateAvailable { .. } => {
+                            egui::Color32::from_rgb(220, 170, 80)
                         }
-                    }
+                        _ => ERR_RED,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.small(egui::RichText::new(r.summary()).color(color));
+                        if let UpdateCheck::UpdateAvailable { release_url, .. } = r {
+                            ui.hyperlink_to("open release", release_url);
+                        }
+                    });
+                    shown_any = true;
                 }
+            } else if test_msg_fresh && !last_test_msg.is_empty() {
+                let color = if last_test_msg.starts_with("Test passed") {
+                    OK_GREEN
+                } else {
+                    ERR_RED
+                };
+                ui.small(egui::RichText::new(last_test_msg).color(color));
+                shown_any = true;
+            } else if ca_trusted_fresh {
+                match ca_trusted {
+                    Some(true) => {
+                        ui.small(
+                            egui::RichText::new("CA appears trusted on this machine.")
+                                .color(OK_GREEN),
+                        );
+                    }
+                    Some(false) => {
+                        ui.small(
+                            egui::RichText::new(
+                                "CA is NOT trusted in the system store. Click Install CA.",
+                            )
+                            .color(ERR_RED),
+                        );
+                    }
+                    None => {}
+                }
+                shown_any = true;
+            }
+            // Reserve a line of space even when empty so the log below doesn't
+            // jump when a transient message appears / disappears.
+            if !shown_any {
+                ui.small(" ");
             }
 
-            ui.separator();
-            ui.label(egui::RichText::new("Recent log").strong());
-            egui::ScrollArea::vertical()
-                .max_height(180.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
+            ui.add_space(4.0);
+
+            // ── Recent log ────────────────────────────────────────────────
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Recent log").strong());
+                ui.checkbox(&mut self.form.show_log, "show");
+                if ui.small_button("save…")
+                    .on_hover_text(
+                        "Write every line in the log panel to a timestamped file in the \
+                         user-data dir. Useful for filing bug reports."
+                    )
+                    .clicked()
+                {
                     let log = self.shared.state.lock().unwrap().log.clone();
-                    for line in log.iter() {
-                        ui.monospace(line);
+                    let fname = format!(
+                        "log-{}.txt",
+                        time::OffsetDateTime::now_utc()
+                            .format(&time::macros::format_description!(
+                                "[year][month][day]-[hour][minute][second]"
+                            ))
+                            .unwrap_or_default(),
+                    );
+                    let path = data_dir::data_dir().join(&fname);
+                    let body: String = log.iter().cloned().collect::<Vec<_>>().join("\n");
+                    match std::fs::write(&path, body) {
+                        Ok(_) => self.toast = Some((
+                            format!("Log saved to {}", path.display()),
+                            Instant::now(),
+                        )),
+                        Err(e) => self.toast = Some((
+                            format!("Log save failed: {}", e),
+                            Instant::now(),
+                        )),
                     }
-                });
+                }
+                if ui.small_button("clear").clicked() {
+                    self.shared.state.lock().unwrap().log.clear();
+                }
+            });
+            if self.form.show_log {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(22, 23, 26))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgb(45, 48, 52),
+                    ))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(220.0)
+                            .min_scrolled_height(220.0)
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                let log = self.shared.state.lock().unwrap().log.clone();
+                                if log.is_empty() {
+                                    ui.small(
+                                        egui::RichText::new("(empty — run some traffic or click Test)")
+                                            .color(egui::Color32::from_gray(120))
+                                            .italics(),
+                                    );
+                                }
+                                for line in log.iter() {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(line).monospace().size(11.0),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                            });
+                    });
+            }
 
             // Transient toast at the bottom. Config-load failures stick for
             // 30s instead of 5 because they explain why the form looks empty.
@@ -1220,12 +1488,16 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 push_log(&shared, "[ui] running test...");
                 rt.spawn(async move {
                     let ok = test_cmd::run(&cfg).await;
-                    shared2.state.lock().unwrap().last_test_ok = Some(ok);
-                    shared2.state.lock().unwrap().last_test_msg = if ok {
-                        "Test passed — relay is working.".into()
-                    } else {
-                        "Test failed — see terminal for details.".into()
-                    };
+                    {
+                        let mut st = shared2.state.lock().unwrap();
+                        st.last_test_ok = Some(ok);
+                        st.last_test_msg = if ok {
+                            "Test passed — relay is working.".into()
+                        } else {
+                            "Test failed — see Recent log below for details.".into()
+                        };
+                        st.last_test_msg_at = Some(Instant::now());
+                    }
                     push_log(
                         &shared2,
                         &format!("[ui] test result: {}", if ok { "pass" } else { "fail" }),
@@ -1247,7 +1519,9 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     match install_ca(&ca) {
                         Ok(()) => {
                             push_log(&shared2, "[ui] CA install ok");
-                            shared2.state.lock().unwrap().ca_trusted = Some(true);
+                            let mut st = shared2.state.lock().unwrap();
+                            st.ca_trusted = Some(true);
+                            st.ca_trusted_at = Some(Instant::now());
                         }
                         Err(e) => {
                             push_log(&shared2, &format!("[ui] CA install failed: {}", e));
@@ -1301,18 +1575,26 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     let base = data_dir::data_dir();
                     let ca = base.join(CA_CERT_FILE);
                     let trusted = mhrv_rs::cert_installer::is_ca_trusted(&ca);
-                    shared2.state.lock().unwrap().ca_trusted = Some(trusted);
+                    let mut st = shared2.state.lock().unwrap();
+                    st.ca_trusted = Some(trusted);
+                    st.ca_trusted_at = Some(Instant::now());
                 });
             }
             Ok(Cmd::CheckUpdate) => {
                 let shared2 = shared.clone();
-                shared2.state.lock().unwrap().last_update_check =
-                    Some(UpdateProbeState::InFlight);
+                {
+                    let mut st = shared2.state.lock().unwrap();
+                    st.last_update_check = Some(UpdateProbeState::InFlight);
+                    st.last_update_check_at = Some(Instant::now());
+                }
                 rt.spawn(async move {
                     let result = mhrv_rs::update_check::check().await;
                     push_log(&shared2, &format!("[ui] update check: {}", result.summary()));
-                    shared2.state.lock().unwrap().last_update_check =
-                        Some(UpdateProbeState::Done(result));
+                    {
+                        let mut st = shared2.state.lock().unwrap();
+                        st.last_update_check = Some(UpdateProbeState::Done(result));
+                        st.last_update_check_at = Some(Instant::now());
+                    }
                 });
             }
             Err(_) => {}

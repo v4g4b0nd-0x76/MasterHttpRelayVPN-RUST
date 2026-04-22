@@ -1317,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "mhrv-rs"
-version = "0.8.6"
+version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",

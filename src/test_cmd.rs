@@ -1,3 +1,17 @@
+//! `mhrv-rs test` — end-to-end probe of the Apps Script relay.
+//!
+//! Sends one GET through the relay to api.ipify.org and verifies the
+//! response is a real IP-lookup response, not just any HTTP 200. Emits
+//! both `println!` (visible on the CLI terminal) and `tracing::info!` /
+//! `warn!` / `error!` (visible in the UI's Recent log panel) — so the UI
+//! user gets actionable feedback when a test fails.
+//!
+//! The stricter PASS criteria (body-shape verification, not just status
+//! line) exists because Apps Script keeps deleted deployments serving for
+//! a grace period (observed up to ~15 min) and because some upstream
+//! failure modes come back 200 OK with an HTML error page inside. Without
+//! checking the body we'd report PASS on a dead deployment.
+
 use std::time::Instant;
 
 use crate::config::Config;
@@ -9,7 +23,9 @@ pub async fn run(config: &Config) -> bool {
     let fronter = match DomainFronter::new(config) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("FAIL: could not create fronter: {}", e);
+            let msg = format!("FAIL: could not create fronter: {}", e);
+            println!("{}", msg);
+            tracing::error!("{}", msg);
             return false;
         }
     };
@@ -19,6 +35,12 @@ pub async fn run(config: &Config) -> bool {
     println!("  google_ip    : {}", config.google_ip);
     println!("  test URL     : {}", TEST_URL);
     println!();
+    tracing::info!(
+        "test: probing {} via SNI={} @ {}",
+        TEST_URL,
+        config.front_domain,
+        config.google_ip
+    );
 
     let t0 = Instant::now();
     let resp = fronter.relay("GET", TEST_URL, &[], &[]).await;
@@ -35,22 +57,97 @@ pub async fn run(config: &Config) -> bool {
     println!("  body    : {}", body_trunc);
     println!();
 
-    let ok = status_line.contains("200 OK");
-    if ok {
-        println!("PASS: relay round-trip successful.");
-        if body.contains("\"ip\"") {
-            println!("      returned an IP address — end-to-end verified.");
+    // Classify the outcome. We want PASS to really mean "the relay is
+    // doing what it's supposed to" — not just "some HTTP response came
+    // back". Criteria, in order:
+    //
+    //   1. Status must be 200 OK.
+    //   2. Body must be valid JSON.
+    //   3. JSON must have an "ip" field with a plausible IPv4/IPv6 value.
+    //
+    // If 2 or 3 fail, classify as SUSPECT — the relay is answering, but
+    // the answer isn't what ipify.org serves. Common root causes: a
+    // deleted Apps Script deployment still in Google's grace period, an
+    // Apps Script auth redirect, or a mismatched AUTH_KEY.
+
+    if !status_line.contains("200 OK") {
+        let verdict = if status_line.contains("502") || status_line.contains("504") {
+            "FAIL (gateway error). Likely: wrong Apps Script ID, bad AUTH_KEY, quota hit, or Google edge unreachable."
+        } else {
+            "FAIL (unexpected status)."
+        };
+        println!("{}", verdict);
+        tracing::error!("test: {}  status={}", verdict, status_line);
+        return false;
+    }
+
+    match serde_json::from_str::<serde_json::Value>(body.trim()) {
+        Ok(v) => {
+            let ip = v.get("ip").and_then(|x| x.as_str()).unwrap_or("");
+            if looks_like_ip(ip) {
+                let msg = format!("PASS: end-to-end verified (response IP = {}).", ip);
+                println!("{}", msg);
+                tracing::info!("test: {}", msg);
+                true
+            } else {
+                // 200 + parseable JSON but no ip field. Apps Script might
+                // be answering with its own envelope because the upstream
+                // call itself errored.
+                println!(
+                    "SUSPECT: 200 OK with JSON, but no recognisable 'ip' field. \
+                     Likely the Apps Script ran but the upstream fetch failed. \
+                     Body preview: {}",
+                    body_trunc
+                );
+                tracing::warn!(
+                    "test: 200 OK without ipify 'ip' field — upstream may be broken. body: {}",
+                    body_trunc.chars().take(200).collect::<String>()
+                );
+                false
+            }
         }
-        true
-    } else if status_line.contains("502") || status_line.contains("504") {
-        println!("FAIL: gateway error. Likely causes:");
-        println!("  - Apps Script deployment ID is wrong");
-        println!("  - auth_key doesn't match Code.gs AUTH_KEY");
-        println!("  - Google IP / front_domain unreachable from this network");
-        println!("  - Apps Script has hit its daily quota (try a different script_id)");
-        false
-    } else {
-        println!("FAIL: unexpected status");
-        false
+        Err(_) => {
+            // 200 with non-JSON body. Classic signature of an Apps Script
+            // auth page, a deleted-deployment HTML page, or Google's
+            // "you need to sign in" redirect reaching us unproxied.
+            let html_signature = body_trunc.contains("<!DOCTYPE")
+                || body_trunc.contains("<html")
+                || body_trunc.to_ascii_lowercase().contains("sign in")
+                || body_trunc.to_ascii_lowercase().contains("moved");
+            let reason = if html_signature {
+                "HTML returned instead of JSON. The Apps Script deployment may be deleted, \
+                 not published to 'Anyone', or requires sign-in."
+            } else {
+                "Non-JSON body returned."
+            };
+            println!("SUSPECT: {}\nbody preview: {}", reason, body_trunc);
+            tracing::warn!(
+                "test: {} body preview: {}",
+                reason,
+                body_trunc.chars().take(200).collect::<String>()
+            );
+            false
+        }
+    }
+}
+
+fn looks_like_ip(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.parse::<std::net::IpAddr>().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_shape_accepts_v4_and_v6() {
+        assert!(looks_like_ip("8.8.8.8"));
+        assert!(looks_like_ip("2001:db8::1"));
+        assert!(!looks_like_ip(""));
+        assert!(!looks_like_ip("not-an-ip"));
+        assert!(!looks_like_ip("999.999.999.999"));
     }
 }
