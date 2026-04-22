@@ -214,3 +214,69 @@ mod tests {
         assert!(cfg.validate().is_err());
     }
 }
+
+#[cfg(test)]
+mod rt_tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_all_current_fields() {
+        // Regression guard: make sure a config written by the UI (all current
+        // optional fields present and populated) loads back cleanly.
+        let json = r#"{
+  "mode": "apps_script",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "script_id": "AKfyc_TEST",
+  "auth_key": "testtesttest",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+  "socks5_port": 8086,
+  "log_level": "info",
+  "verify_ssl": true,
+  "upstream_socks5": "127.0.0.1:50529",
+  "parallel_relay": 2,
+  "sni_hosts": ["www.google.com", "drive.google.com"],
+  "fetch_ips_from_api": true,
+  "max_ips_to_scan": 50,
+  "scan_batch_size": 100,
+  "google_ip_validation": true
+}"#;
+        let tmp = std::env::temp_dir().join("mhrv-rt-test.json");
+        std::fs::write(&tmp, json).unwrap();
+        let cfg = Config::load(&tmp).expect("config should load");
+        assert_eq!(cfg.mode, "apps_script");
+        assert_eq!(cfg.auth_key, "testtesttest");
+        assert_eq!(cfg.listen_port, 8085);
+        assert_eq!(cfg.upstream_socks5.as_deref(), Some("127.0.0.1:50529"));
+        assert_eq!(cfg.parallel_relay, 2);
+        assert_eq!(
+            cfg.sni_hosts.as_ref().unwrap(),
+            &vec!["www.google.com".to_string(), "drive.google.com".to_string()]
+        );
+        assert_eq!(cfg.fetch_ips_from_api, true);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn round_trip_minimal_fields_only() {
+        // User saves with defaults for everything optional. This is what the
+        // UI's save button actually writes for a first-run user.
+        let json = r#"{
+  "mode": "apps_script",
+  "google_ip": "216.239.38.120",
+  "front_domain": "www.google.com",
+  "script_id": "A",
+  "auth_key": "secretkey123",
+  "listen_host": "127.0.0.1",
+  "listen_port": 8085,
+  "log_level": "info",
+  "verify_ssl": true
+}"#;
+        let tmp = std::env::temp_dir().join("mhrv-rt-min.json");
+        std::fs::write(&tmp, json).unwrap();
+        let cfg = Config::load(&tmp).expect("minimal config should load");
+        assert_eq!(cfg.mode, "apps_script");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}

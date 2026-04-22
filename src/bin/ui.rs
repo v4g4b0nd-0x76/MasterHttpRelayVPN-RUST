@@ -46,7 +46,8 @@ fn main() -> eframe::Result<()> {
         .spawn(move || background_thread(shared_bg, cmd_rx))
         .expect("failed to spawn background thread");
 
-    let form = load_form();
+    let (form, load_err) = load_form();
+    let initial_toast = load_err.map(|e| (e, Instant::now()));
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -66,7 +67,7 @@ fn main() -> eframe::Result<()> {
                 cmd_tx,
                 form,
                 last_poll: Instant::now(),
-                toast: None,
+                toast: initial_toast,
             }))
         }),
     )
@@ -161,17 +162,42 @@ struct SniRow {
     enabled: bool,
 }
 
-fn load_form() -> FormState {
+fn load_form() -> (FormState, Option<String>) {
+    // Try the user-data config first, then the cwd fallback. Report WHY load
+    // fails so the user isn't silently shown a blank form (issue: user reports
+    // 'settings saved to file but not loaded back'). Without this signal the
+    // failure is invisible — `.ok()` swallows it and the form looks fresh.
     let path = data_dir::config_path();
     let cwd = PathBuf::from("config.json");
-    let existing = if path.exists() {
-        Config::load(&path).ok()
+
+    let (existing, load_err): (Option<Config>, Option<String>) = if path.exists() {
+        tracing::info!("config: attempting load from {}", path.display());
+        match Config::load(&path) {
+            Ok(c) => {
+                tracing::info!("config: loaded OK from {}", path.display());
+                (Some(c), None)
+            }
+            Err(e) => {
+                let msg = format!("Config at {} failed to load: {}", path.display(), e);
+                tracing::warn!("{}", msg);
+                (None, Some(msg))
+            }
+        }
     } else if cwd.exists() {
-        Config::load(&cwd).ok()
+        tracing::info!("config: attempting fallback load from {}", cwd.display());
+        match Config::load(&cwd) {
+            Ok(c) => (Some(c), None),
+            Err(e) => {
+                let msg = format!("Config at {} failed to load: {}", cwd.display(), e);
+                tracing::warn!("{}", msg);
+                (None, Some(msg))
+            }
+        }
     } else {
-        None
+        tracing::info!("config: no config found at {} — starting with defaults", path.display());
+        (None, None)
     };
-    if let Some(c) = existing {
+    let form = if let Some(c) = existing {
         let sid = match &c.script_id {
             Some(ScriptId::One(s)) => s.clone(),
             Some(ScriptId::Many(v)) => v.join("\n"),
@@ -225,7 +251,8 @@ fn load_form() -> FormState {
             google_ip_validation:true,
             scan_batch_size:500
         }
-    }
+    };
+    (form, load_err)
 }
 
 /// Build the initial `sni_pool` list shown in the editor.
@@ -762,9 +789,15 @@ impl eframe::App for App {
                     }
                 });
 
-            // Transient toast at the bottom.
+            // Transient toast at the bottom. Config-load failures stick for
+            // 30s instead of 5 because they explain why the form looks empty.
             if let Some((msg, t)) = &self.toast {
-                if t.elapsed() < Duration::from_secs(5) {
+                let ttl = if msg.contains("failed to load") {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_secs(5)
+                };
+                if t.elapsed() < ttl {
                     ui.add_space(4.0);
                     ui.colored_label(egui::Color32::from_rgb(200, 170, 80), msg);
                 } else {
