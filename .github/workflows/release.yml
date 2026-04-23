@@ -374,10 +374,14 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # Python over curl/bash so we don't have to fight curl's -F
+        # value-interpretation rules. curl treats `-F "caption=<..."`
+        # as "read the caption from file named ..." when the value
+        # starts with `<`, which matches our `<b>` HTML-bold tags and
+        # silently turns the whole job into a "file not found" exit
+        # 26. Python stdlib has no such wart.
         run: |
           set -euo pipefail
-
-          # Pull the tag off refs/tags/v1.2.3 → "1.2.3".
           VER="${GITHUB_REF#refs/tags/v}"
           APK="apk/mhrv-rs-android-universal-v${VER}.apk"
 
@@ -387,63 +391,13 @@ jobs:
           fi
 
           if [ ! -f "$APK" ]; then
-            echo "::error::expected $APK to exist; actually got:"
+            echo "::error::expected $APK to exist; got:"
             ls -la apk/
             exit 1
           fi
 
-          SHA256=$(sha256sum "$APK" | awk '{print $1}')
-          CAPTION="<b>mhrv-rs Android v${VER}</b>
-
-          SHA-256: <code>${SHA256}</code>
-          https://github.com/${GITHUB_REPOSITORY}
-          https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${VER}"
-
-          echo "Sending APK with short caption..."
-          DOC_RESP=$(curl -sS --fail-with-body -X POST \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-            -F "chat_id=${CHAT_ID}" \
-            -F "document=@${APK}" \
-            -F "caption=${CAPTION}" \
-            -F "parse_mode=HTML")
-          DOC_MID=$(printf '%s' "$DOC_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['message_id'])")
-          echo "sendDocument OK, message_id=$DOC_MID"
-
-          # Full changelog as a reply. Split on the first line that's
-          # exactly `---`; anything before = Persian, after = English.
-          # Missing changelog file → skip the reply (not fatal).
-          CL_FILE="docs/changelog/v${VER}.md"
-          if [ ! -f "$CL_FILE" ]; then
-            echo "::notice::no $CL_FILE, skipping changelog reply"
-            exit 0
-          fi
-
-          python3 - "$CL_FILE" <<'PY' > /tmp/cl_fa.txt
-          import sys
-          body = open(sys.argv[1]).read()
-          # Strip the HTML comment header (between <!-- and -->).
-          import re
-          body = re.sub(r'<!--.*?-->\s*', '', body, count=1, flags=re.S)
-          fa, _, _ = body.partition('\n---\n')
-          sys.stdout.write(fa.strip())
-          PY
-          python3 - "$CL_FILE" <<'PY' > /tmp/cl_en.txt
-          import sys, re
-          body = open(sys.argv[1]).read()
-          body = re.sub(r'<!--.*?-->\s*', '', body, count=1, flags=re.S)
-          _, _, en = body.partition('\n---\n')
-          sys.stdout.write(en.strip())
-          PY
-
-          REPLY="<blockquote>$(cat /tmp/cl_fa.txt)</blockquote>
-
-          <blockquote>$(cat /tmp/cl_en.txt)</blockquote>"
-
-          echo "Sending changelog reply..."
-          curl -sS --fail-with-body -X POST \
-            "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${REPLY}" \
-            --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "reply_to_message_id=${DOC_MID}" > /dev/null
-          echo "Reply OK"
+          python3 .github/scripts/telegram_release_notify.py \
+            --apk "$APK" \
+            --version "$VER" \
+            --repo "$GITHUB_REPOSITORY" \
+            --changelog "docs/changelog/v${VER}.md"
