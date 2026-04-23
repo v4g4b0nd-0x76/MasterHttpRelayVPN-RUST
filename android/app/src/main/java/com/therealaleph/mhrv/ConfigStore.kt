@@ -285,10 +285,11 @@ val DEFAULT_SNI_POOL: List<String> = listOf(
     "drive.google.com",
     "docs.google.com",
     "calendar.google.com",
-    // Issue #42: passes DPI on Samantel / MCI where the longer google.com
-    // subdomains are selectively SNI-blocked. Must mirror the Rust list
-    // in src/domain_fronter.rs exactly.
-    "accounts.googl.com",
+    // accounts.google.com — originally listed as accounts.googl.com per
+    // issue #42, but googl.com is NOT in Google's GFE cert SAN so TLS
+    // validation fails with verify_ssl=true (PR #92). Replaced with
+    // accounts.google.com which is covered by the *.google.com wildcard.
+    "accounts.google.com",
     // Issue #47: same DPI-passing behaviour on MCI / Samantel.
     "scholar.google.com",
     // Ported from upstream Python FRONT_SNI_POOL_GOOGLE (commit 57738ec);
