@@ -470,7 +470,7 @@ impl DomainFronter {
             if let Some(hit) = self.cache.get(k) {
                 tracing::debug!("cache hit: {}", url);
                 self.record_site(url, true, hit.len() as u64, t_start.elapsed().as_nanos() as u64);
-                return hit;
+                return hit.as_ref().clone();
             }
         }
 
