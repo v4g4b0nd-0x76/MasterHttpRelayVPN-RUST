@@ -66,7 +66,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Skip the host-level rustup install for mipsel-softfloat — that
+      # target is tier-3 in stable Rust (no prebuilt stdlib available
+      # via rustup), and the docker image we use for this build ships
+      # its own Rust toolchain + std. Trying to pass
+      # `targets: mipsel-unknown-linux-musl` to dtolnay/rust-toolchain
+      # errors out with "error: component 'rust-std' for target
+      # 'mipsel-unknown-linux-musl' is unavailable for download", which
+      # fails the job before the docker step ever runs.
       - uses: dtolnay/rust-toolchain@stable
+        if: matrix.mipsel_softfloat != true
         with:
           targets: ${{ matrix.target }}
 
