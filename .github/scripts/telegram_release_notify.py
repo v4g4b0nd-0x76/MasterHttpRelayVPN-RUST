@@ -179,10 +179,21 @@ def main() -> int:
 
     ver = args.version
     sha = sha256_of(args.apk)
+    # Caption structure requested by the repo owner:
+    #   1. Title + SHA-256 (as before)
+    #   2. Persian preamble labelling the repo link as
+    #      "GitHub repo + full Persian guide"
+    #   3. Repo URL
+    #   4. Persian preamble labelling the release link as
+    #      "this version's release — desktop/router builds live here"
+    #   5. Release URL
+    # Keeps total well under Telegram's 1024-char caption limit.
     caption = (
         f"<b>mhrv-rs Android v{ver}</b>\n\n"
-        f"SHA-256: <code>{sha}</code>\n"
-        f"https://github.com/{args.repo}\n"
+        f"SHA-256: <code>{sha}</code>\n\n"
+        f"مخزن گیتهاب  + مطالعه راهنمای کامل فارسی:\n"
+        f"https://github.com/{args.repo}\n\n"
+        f"لینک به این نسخه جهت دریافت نسخه های مربوط به مودم و کامپیوتر:\n"
         f"https://github.com/{args.repo}/releases/tag/v{ver}"
     )
 
