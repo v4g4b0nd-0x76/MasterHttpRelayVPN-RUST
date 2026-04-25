@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -604,6 +604,22 @@ const UDP_INITIAL_POLL_DELAY: Duration = Duration::from_millis(500);
 /// so an idle UDP destination costs roughly one batch slot every 35 s.
 const UDP_MAX_POLL_DELAY: Duration = Duration::from_secs(30);
 
+/// Cap on simultaneous UDP relay sessions per SOCKS5 ASSOCIATE. STUN
+/// candidate gathering and DNS fanout produce dozens of distinct
+/// targets; an abusive or runaway client could produce thousands.
+/// 256 is generous for legitimate use and bounds tunnel-node UDP
+/// sessions a single ASSOCIATE can hold open. On overflow we evict
+/// the least-recently-inserted target (rough LRU — good enough for
+/// long-tail eviction without tracking access on the hot path).
+const MAX_UDP_SESSIONS_PER_ASSOCIATE: usize = 256;
+
+/// Drop UDP datagrams larger than this (pre-base64). Standard MTU is
+/// 1500B, jumbo frames are ~9000B; anything above that is either a
+/// pathologically fragmented IP datagram or abusive traffic. Each
+/// datagram carries ~33% base64 + JSON envelope overhead and consumes
+/// Apps Script per-account quota, so a permissive ceiling here matters.
+const MAX_UDP_PAYLOAD_BYTES: usize = 9 * 1024;
+
 async fn handle_socks5_udp_associate(
     mut control: TcpStream,
     rewrite_ctx: Arc<RewriteCtx>,
@@ -623,15 +639,18 @@ async fn handle_socks5_udp_associate(
     // Per RFC 1928 §6 the UDP relay only accepts datagrams from the
     // SOCKS5 client. We pin the source IP to the control TCP peer up
     // front so a third party on the bind interface can't hijack the
-    // session by sending the first datagram.
+    // session by sending the first datagram. THIS — not the bind IP
+    // below — is what actually keeps unauthenticated traffic out.
     let client_peer_ip = control.peer_addr()?.ip();
 
-    // The local TUN bridge talks to us over loopback. Binding the UDP relay
-    // there avoids exposing an unauthenticated UDP socket on LAN interfaces.
-    let bind_ip = match control.local_addr()?.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        ip => ip,
-    };
+    // Bind the UDP relay to the same local IP the SOCKS5 client used
+    // to reach the control TCP socket. `TcpStream::local_addr()` on an
+    // accepted socket returns the concrete terminating address (e.g.
+    // 127.0.0.1 for a loopback client, 192.168.1.5 for a LAN client),
+    // not the listener's bind specifier — so this naturally tracks the
+    // path the client took. Source-IP filtering above is the security
+    // boundary; the bind choice is just about reachability.
+    let bind_ip = control.local_addr()?.ip();
     let udp = Arc::new(UdpSocket::bind(SocketAddr::new(bind_ip, 0)).await?);
     write_socks5_reply(&mut control, 0x00, Some(udp.local_addr()?)).await?;
     tracing::info!(
@@ -645,6 +664,12 @@ async fn handle_socks5_udp_associate(
     let mut client_addr: Option<SocketAddr> = None;
     let sessions: Arc<Mutex<HashMap<SocksUdpTarget, UdpRelaySession>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // Insertion-order log used for LRU-on-overflow eviction. We track
+    // it alongside (rather than inside) the HashMap so eviction can
+    // run under the same lock as the cap check.
+    let mut insertion_order: VecDeque<SocksUdpTarget> = VecDeque::new();
+    let mut oversized_dropped: u64 = 0;
+    let mut sessions_evicted: u64 = 0;
 
     loop {
         tokio::select! {
@@ -674,6 +699,23 @@ async fn handle_socks5_udp_associate(
                 let Some((target, payload)) = parse_socks5_udp_packet(&buf[..n]) else {
                     continue;
                 };
+
+                // Size guard: drop oversize datagrams before they reach
+                // the mux. Each datagram costs ~payload * 1.33 in the
+                // batched JSON envelope plus tunnel-node CPU; uncapped,
+                // a runaway client can exhaust Apps Script quota.
+                if payload.len() > MAX_UDP_PAYLOAD_BYTES {
+                    oversized_dropped += 1;
+                    if oversized_dropped == 1 || oversized_dropped.is_multiple_of(100) {
+                        tracing::debug!(
+                            "udp datagram dropped: {} B > {} B (count={})",
+                            payload.len(),
+                            MAX_UDP_PAYLOAD_BYTES,
+                            oversized_dropped,
+                        );
+                    }
+                    continue;
+                }
                 let payload = payload.to_vec();
 
                 // Fast path: existing session — push payload onto its
@@ -683,6 +725,35 @@ async fn handle_socks5_udp_associate(
                     if let Some(session) = sess.get(&target) {
                         let _ = session.uplink.try_send(payload);
                         continue;
+                    }
+                }
+
+                // Cap reached → evict the oldest session before opening
+                // a new one. The evicted target's `UdpRelaySession` is
+                // dropped here, which closes its uplink channel; the
+                // task then exits its select! and tells tunnel-node to
+                // close. Any in-flight uplink already in the channel is
+                // delivered before the task exits.
+                {
+                    let mut sess = sessions.lock().await;
+                    while sess.len() >= MAX_UDP_SESSIONS_PER_ASSOCIATE {
+                        let Some(victim) = insertion_order.pop_front() else {
+                            break;
+                        };
+                        if sess.remove(&victim).is_some() {
+                            sessions_evicted += 1;
+                            if sessions_evicted == 1
+                                || sessions_evicted.is_multiple_of(50)
+                            {
+                                tracing::debug!(
+                                    "udp session cap {} reached; evicted {}:{} (total evicted={})",
+                                    MAX_UDP_SESSIONS_PER_ASSOCIATE,
+                                    victim.host,
+                                    victim.port,
+                                    sessions_evicted,
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -734,6 +805,7 @@ async fn handle_socks5_udp_associate(
                     task_sessions.lock().await.remove(&task_target);
                 });
 
+                insertion_order.push_back(target.clone());
                 sessions
                     .lock()
                     .await
@@ -832,7 +904,20 @@ async fn send_udp_response_packets(
     };
     for packet in packets {
         let framed = build_socks5_udp_packet(target, &packet);
-        let _ = udp.send_to(&framed, client_addr).await;
+        if let Err(e) = udp.send_to(&framed, client_addr).await {
+            // Errors here mean the local socket can't reach the SOCKS5
+            // client (ENETUNREACH, EHOSTDOWN, etc.). Surface at debug
+            // so a "my UDP traffic isn't coming back" report has
+            // something to grep for; volume is bounded by what we'd
+            // have delivered anyway.
+            tracing::debug!(
+                "udp send to client {} failed for {}:{}: {}",
+                client_addr,
+                target.host,
+                target.port,
+                e,
+            );
+        }
     }
 }
 
@@ -890,7 +975,12 @@ fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(SocksUdpTarget, &[u8])> {
             }
             let addr = buf[pos..pos + len].to_vec();
             pos += len;
-            (String::from_utf8_lossy(&addr).into_owned(), addr)
+            // Reject non-UTF-8 hostnames at the parser. Lossy decoding
+            // would forward U+FFFD into DNS and trigger an opaque
+            // NXDOMAIN — failing fast here gives us a clean parse-level
+            // drop that the test suite can assert on.
+            let host = std::str::from_utf8(&addr).ok()?.to_owned();
+            (host, addr)
         }
         0x04 => {
             if buf.len() < pos + 16 + 2 {
@@ -2023,6 +2113,15 @@ mod tests {
     #[test]
     fn socks5_udp_rejects_fragmented_packets() {
         let raw = [0, 0, 1, 0x01, 127, 0, 0, 1, 0x13, 0x8a, b'x'];
+        assert!(parse_socks5_udp_packet(&raw).is_none());
+    }
+
+    #[test]
+    fn socks5_udp_rejects_non_utf8_domain() {
+        // Lone continuation byte (0x80) — not valid UTF-8. Lossy decode
+        // would forward U+FFFD into DNS; strict parse should reject so
+        // we fail fast instead of issuing a doomed lookup.
+        let raw = [0, 0, 0, 0x03, 1, 0x80, 0, 80];
         assert!(parse_socks5_udp_packet(&raw).is_none());
     }
 
