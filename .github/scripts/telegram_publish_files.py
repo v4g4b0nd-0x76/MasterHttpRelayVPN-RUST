@@ -339,24 +339,51 @@ def files_channel_post_link(chat_id: str, message_id: int) -> str:
 def post_main_channel_pointer(
     bot_token: str,
     main_chat_id: str,
-    files_channel_link: str,
+    files_channel_post_link: str,
     version: str,
     hashtag: str,
+    channel_username_link: str = "",
+    channel_invite_link: str = "",
 ) -> bool:
     """Post a short cross-link to the main announcement channel pointing
     at the anchor post in the files channel. Replaces the previous
     behaviour of posting the universal APK + full changelog directly
     to the main channel — the main channel becomes a discovery surface
     while the files channel hosts the actual artifacts.
+
+    Includes channel-join links (public username + invite hash) at the
+    bottom so recipients who aren't yet members can subscribe before
+    clicking through to the specific release post.
     """
-    text = (
-        f"<b>📦 mhrv-rs v{html_escape(version)} منتشر شد</b>\n"
-        f"\nبرای دانلود فایل‌ها (Android، Windows، macOS، Linux و ...) "
-        f"به کانال فایل‌ها مراجعه کنید:\n"
-        f"\n👉 <a href=\"{html_escape(files_channel_link)}\">"
-        f"v{html_escape(version)} — همه فایل‌ها + SHA-256</a>\n"
-        f"\n{hashtag}"
-    )
+    parts = [
+        f"<b>📦 mhrv-rs v{html_escape(version)} منتشر شد</b>",
+        "",
+        f"برای دانلود فایل‌ها (Android، Windows، macOS، Linux و ...) "
+        f"به کانال فایل‌ها مراجعه کنید:",
+        "",
+        f"👉 <a href=\"{html_escape(files_channel_post_link)}\">"
+        f"v{html_escape(version)} — همه فایل‌ها + SHA-256</a>",
+    ]
+    # Channel-join links. Two forms handle different states of the
+    # files channel: the `t.me/<username>` form works for public
+    # channels and is the prettier link; the `t.me/+<hash>` invite
+    # link works regardless of whether the channel is public, and is
+    # the only path in for private/restricted channels. Showing both
+    # is forgiving — recipients click whichever works for them.
+    if channel_username_link or channel_invite_link:
+        parts.append("")
+        parts.append("لینک کانال:")
+        if channel_username_link:
+            # Render as plain URL (not HTML <a>) so the text shows the
+            # link itself — useful when users share the message via
+            # screenshot or copy-paste outside Telegram, which would
+            # strip the <a href> wrapper.
+            parts.append(html_escape(channel_username_link))
+        if channel_invite_link:
+            parts.append(f"و یا: {html_escape(channel_invite_link)}")
+    parts.append("")
+    parts.append(hashtag)
+    text = "\n".join(parts)
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = urllib.parse.urlencode({
         "chat_id": main_chat_id,
@@ -472,11 +499,30 @@ def main() -> int:
     main_chat_id = os.environ.get("MAIN_CHAT_ID", "").strip()
     if main_chat_id and announce_msg_id is not None:
         link = files_channel_post_link(chat_id, announce_msg_id)
+        # Optional channel-join links rendered alongside the cross-link.
+        # `FILES_CHANNEL_USERNAME` is the public-username form (clean
+        # `t.me/<name>` URL — clickable for everyone). `FILES_CHANNEL_INVITE`
+        # is the `t.me/+<hash>` invite link, the only join path for
+        # private channels. Either or both can be set; both render in
+        # the body as separate lines.
+        username = os.environ.get("FILES_CHANNEL_USERNAME", "").strip().lstrip("@")
+        username_link = f"https://t.me/{username}" if username else ""
+        invite_link = os.environ.get("FILES_CHANNEL_INVITE", "").strip()
         print()
         print(f"posting cross-link to main channel:")
-        print(f"  link: {link}")
+        print(f"  post link: {link}")
+        if username_link:
+            print(f"  channel username link: {username_link}")
+        if invite_link:
+            print(f"  channel invite link:   {invite_link}")
         ok = post_main_channel_pointer(
-            bot_token, main_chat_id, link, args.version, args.hashtag
+            bot_token,
+            main_chat_id,
+            link,
+            args.version,
+            args.hashtag,
+            channel_username_link=username_link,
+            channel_invite_link=invite_link,
         )
         if not ok:
             failures += 1

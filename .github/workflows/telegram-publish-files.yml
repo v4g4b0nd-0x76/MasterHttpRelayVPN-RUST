@@ -110,12 +110,22 @@ jobs:
           # APK + full changelog. Sourced from the same secret the
           # legacy `telegram` job in release.yml used.
           MAIN_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # Optional: if the files channel later gets a public username,
-          # set the repo variable `FILES_CHANNEL_USERNAME` (without the
-          # `@`) so the cross-link uses the prettier `t.me/<name>/<msg>`
-          # form instead of `t.me/c/<id>/<msg>` (which only resolves for
-          # channel members).
-          FILES_CHANNEL_USERNAME: ${{ vars.FILES_CHANNEL_USERNAME }}
+          # Public-username form of the files channel link. Used for
+          # both (a) the post-link in the main-channel cross-post — so
+          # `t.me/<name>/<msg>` works for everyone, not just members
+          # via `t.me/c/<id>/<msg>` — and (b) one of the two
+          # channel-join links rendered at the bottom of the cross-post.
+          # Defaults to `mhrv_rs` (current public username); override via
+          # repo variable if the channel is renamed.
+          FILES_CHANNEL_USERNAME: ${{ vars.FILES_CHANNEL_USERNAME || 'mhrv_rs' }}
+          # `t.me/+<hash>` invite link for the files channel. Rendered
+          # as the second channel-join option in the main-channel
+          # cross-post — the only join path that works for users coming
+          # from outside Telegram search (private/restricted channels)
+          # or whose Telegram client doesn't resolve usernames cleanly.
+          # Override via repo variable if the channel's invite hash is
+          # rotated.
+          FILES_CHANNEL_INVITE: ${{ vars.FILES_CHANNEL_INVITE || 'https://t.me/+R1OyoHX2boA1ZDgx' }}
         run: |
           if [ -z "${BOT_TOKEN:-}" ]; then
             echo "::error::TELEGRAM_BOT_TOKEN not set; can't publish"
